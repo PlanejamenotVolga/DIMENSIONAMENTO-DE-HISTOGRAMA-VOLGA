@@ -532,6 +532,63 @@ async function carregarCatalogoDoBanco() {
   }
 }
 
+async function carregarComposicoesDoBanco() {
+  if (!sb) return null;
+  try {
+    const [rTpl, rVer, rItens] = await Promise.all([
+      sb.from('composition_templates').select('id, codigo, nome, disciplina').eq('active', true),
+      sb.from('composition_versions')
+        .select('id, template_id, versao, inputs_schema, vars, notas, status')
+        .eq('status', 'publicado').eq('versao', 1),
+      sb.from('composition_version_items')
+        .select('composition_version_id, ordem, codigo, by_param, map_param, expressao_quantidade')
+        .order('ordem')
+    ]);
+    if (rTpl.error || rVer.error || rItens.error) {
+      console.warn('[Composições] erro no banco, usando fallback local');
+      return null;
+    }
+    const verPorTpl = Object.fromEntries(rVer.data.map(v => [v.template_id, v]));
+    const itensPorVer = {};
+    for (const i of rItens.data) {
+      (itensPorVer[i.composition_version_id] ||= []).push(i);
+    }
+    const catalog = [];
+    for (const t of rTpl.data) {
+      const v = verPorTpl[t.id];
+      if (!v) continue;
+      const inputs = (v.inputs_schema || []).map(p => ({ ...p }));
+      const vars = (v.vars || []).map(w => Array.isArray(w) ? { k: w[0], f: w[1] } : w);
+      const notas = v.notas || [];
+      const acts = (itensPorVer[v.id] || []).map(it => {
+        if (it.by_param && it.map_param) {
+          return {
+            cod: it.codigo || Object.values(it.map_param)[0],
+            by: it.by_param,
+            map: it.map_param,
+            f: it.expressao_quantidade
+          };
+        }
+        return { cod: it.codigo, f: it.expressao_quantidade };
+      });
+      catalog.push({
+        id: t.codigo,
+        nome: t.nome,
+        disc: t.disciplina || 'CIVIL',
+        inputs,
+        vars,
+        acts,
+        notas
+      });
+    }
+    console.log(`[Composições] carregadas do banco: ${catalog.length}`);
+    return catalog;
+  } catch (e) {
+    console.warn('[Composições] falha:', e.message);
+    return null;
+  }
+}
+
 async function init() {
   // 1. Sempre começa com o estado local (nunca fica em branco)
   try {
@@ -541,7 +598,7 @@ async function init() {
     S = defaults();
   }
   migrate(S);
-  
+
     // Tenta enriquecer o catálogo do banco
   const cat = await carregarCatalogoDoBanco();
   if (cat && cat.base.length > 0) {
@@ -551,6 +608,19 @@ async function init() {
     // REC/TIPO são const — não podemos reatribuir, mas o S.base já é suficiente
   }
 
+    // Fase 2: composições do banco
+  const catComps = await carregarComposicoesDoBanco();
+  if (catComps && catComps.length) {
+    const porId = Object.fromEntries((S.comps || []).map(c => [c.id, c]));
+    S.comps = catComps.map(cat => {
+      const existente = porId[cat.id];
+      if (!existente) {
+        return { ...cat, crewDef: 1, crew: {}, usar: false, pred: '', lag: 0, inicio: '' };
+      }
+      return { ...existente, nome: cat.nome, disc: cat.disc, notas: cat.notas };
+    });
+  }
+  
   sel = null;
   render();
   atualizarNomeProjeto();
