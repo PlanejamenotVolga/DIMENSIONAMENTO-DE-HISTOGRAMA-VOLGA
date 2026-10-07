@@ -58,6 +58,9 @@ td.n,th.n{text-align:right}
   <button onclick="novoProjeto()">Novo projeto</button>
   <button onclick="exportJSON()">Exportar .json</button>
   <button onclick="document.getElementById('imp').click()">Importar .json</button>
+  <button onclick="aprovarRevisao()" id="btnAprovar">Aprovar revisão</button>
+  <button onclick="listarRevisoes()">Ver revisões</button>
+  <button onclick="novaRevisao()" id="btnNovaRev" style="display:none">Nova revisão</button>
   <input type="file" id="imp" accept=".json" class="hide" onchange="importJSON(this)">
   <button onclick="if(confirm('Restaurar exemplo? O projeto atual continua salvo no banco.')){S=defaults();migrate(S);render()}">Restaurar exemplo</button>
 </header>
@@ -76,6 +79,8 @@ const SUPABASE_KEY = 'sb_publishable_2Lvithz8wtr6q-fD6n1jTw_QJ0YbRl7';
 let sb = null;                  // ← renomeado
 let currentProjectId = null;
 let currentProjectName = null;
+let readOnly = false;
+let currentApprovedRevision = null;
 
 try {
   if (!window.supabase || !window.supabase.createClient) {
@@ -169,7 +174,8 @@ function save() {
   // Backup local sempre (não bloqueia)
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
   
-  if (!initDone) return;   // ← trava durante o init
+  if (!initDone) return;
+  if (readOnly) return;   // ← trava durante o init
   if (!sb) return;
 
   // Debounce: só envia 1s após a última alteração
@@ -223,10 +229,13 @@ async function novoProjeto() {
   if (!confirm('Criar novo projeto? O atual permanece salvo no banco.')) return;
   currentProjectId = null;
   currentProjectName = null;
+  readOnly = false;
+  currentApprovedRevision = null;
   S = defaults();
   migrate(S);
   sel = null;
   atualizarNomeProjeto();
+  atualizarBotoesRevisao();
   render();
 }
 
@@ -264,7 +273,17 @@ function render(){
  const T=[['comp','Composições'],['cron','Cronograma'],['hist','Histograma'],['base','Base de atividades'],['par','Parâmetros']];
  $('#nav').innerHTML=T.map(t=>`<button class="${tab===t[0]?'on':''}" onclick="setTab('${t[0]}')">${t[1]}</button>`).join('');
  ({comp:rComp,cron:rCron,hist:rHist,base:rBase,par:rPar})[tab]();
- save();   // <-- ADICIONE ESTA LINHA
+ save();
+  const main = document.getElementById('main');
+  if (main) {
+    if (readOnly) {
+      main.style.pointerEvents = 'none';
+      main.style.opacity = '0.65';
+    } else {
+      main.style.pointerEvents = '';
+      main.style.opacity = '';
+    }
+  }   // <-- ADICIONE ESTA LINHA
 }
 // Parâmetros
 function setDia(i,v){const a=S.params.dias;a[i]=v;if(!a.some(Boolean)){a[i]=true;alert('Pelo menos um dia da semana precisa ser dia de trabalho.')}render()}
@@ -627,6 +646,167 @@ async function sincronizarScheduleActivities(projectId, state) {
   }
 }
 let initDone = false;
+
+function atualizarBotoesRevisao() {
+  const bAprov = document.getElementById('btnAprovar');
+  const bNova  = document.getElementById('btnNovaRev');
+  if (!bAprov || !bNova) return;
+  bAprov.style.display = readOnly ? 'none' : '';
+  bNova.style.display  = readOnly ? '' : 'none';
+  const el = document.getElementById('projName');
+  if (el) {
+    const base = currentProjectName || (currentProjectId ? '(sem nome)' : 'novo');
+    if (readOnly && currentApprovedRevision) {
+      el.textContent = `${base} — revisão nº ${currentApprovedRevision.numero} aprovada (somente leitura)`;
+    } else {
+      el.textContent = base;
+    }
+  }
+}
+
+async function aprovarRevisao() {
+  if (!currentProjectId) return alert('Salve o projeto primeiro.');
+  if (!sb) return alert('Supabase indisponível.');
+  if (readOnly) return alert('Já aprovado.');
+
+  const just = prompt('Justificativa da aprovação (opcional):', '') || '';
+
+  const { data: ultima } = await sb.from('project_revisions')
+    .select('id, numero')
+    .eq('project_id', currentProjectId)
+    .order('numero', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const numero   = (ultima?.numero || 0) + 1;
+  const parentId = ultima?.id || null;
+
+  const { data: sched } = await sb.from('schedule_activities')
+    .select('*')
+    .eq('project_id', currentProjectId)
+    .order('ordem');
+
+  let histSnapshot = null;
+  try {
+    const h = histo();
+    histSnapshot = {
+      map: h.map,
+      sc: Object.fromEntries(Object.entries(h.sc).map(([k, v]) => [k, {
+        ini: iso(v.ini), fim: iso(v.fim), days: v.days,
+        dur: v.k.dur, days_count: v.k.days
+      }]))
+    };
+  } catch (e) { console.warn('[Revisão] snapshot do histograma falhou:', e); }
+
+  const { data: rev, error } = await sb.from('project_revisions').insert({
+    project_id: currentProjectId,
+    numero,
+    parent_revision_id: parentId,
+    status: 'aprovado',
+    state_snapshot: S,
+    schedule_snapshot: sched || [],
+    histogram_snapshot: histSnapshot,
+    created_by: 'Osvaldo',
+    approved_at: new Date().toISOString(),
+    justificativa: just
+  }).select().single();
+
+  if (error) return alert('Erro: ' + error.message);
+
+  await sb.from('projects').update({ approved_revision_id: rev.id }).eq('id', currentProjectId);
+
+  currentApprovedRevision = rev;
+  readOnly = true;
+  atualizarBotoesRevisao();
+  render();
+  alert(`Revisão nº ${numero} aprovada.`);
+}
+
+async function novaRevisao() {
+  if (!currentProjectId) return;
+  if (!confirm('Criar uma nova revisão a partir do estado atual?\n\nA revisão aprovada permanece imutável.')) return;
+
+  await sb.from('projects').update({ approved_revision_id: null }).eq('id', currentProjectId);
+  currentApprovedRevision = null;
+  readOnly = false;
+  atualizarBotoesRevisao();
+  render();
+  alert('Edição liberada. As alterações serão consolidadas na próxima aprovação.');
+}
+
+async function listarRevisoes() {
+  if (!currentProjectId) return alert('Salve o projeto primeiro.');
+  if (!sb) return alert('Supabase indisponível.');
+
+  const { data, error } = await sb.from('project_revisions')
+    .select('id, numero, status, created_at, approved_at, justificativa, created_by, histogram_snapshot, state_snapshot')
+    .eq('project_id', currentProjectId)
+    .order('numero', { ascending: false });
+
+  if (error) return alert(error.message);
+  if (!data || !data.length) return alert('Nenhuma revisão aprovada ainda.');
+
+  const linhas = data.map(r => {
+    const quando = new Date(r.approved_at || r.created_at).toLocaleString('pt-BR');
+    const nAtiv = (r.state_snapshot?.comps || []).reduce((a, c) => a + (c.acts?.length || 0), 0);
+    const pico = r.histogram_snapshot?.map
+      ? Object.values(r.histogram_snapshot.map)
+          .reduce((max, dia) => Math.max(max, Object.values(dia).reduce((a, b) => a + b, 0)), 0)
+      : '—';
+    return `Nº ${r.numero} · ${quando} · ${nAtiv} ativ. · pico ${pico.toFixed ? pico.toFixed(1) : pico}` +
+           (r.justificativa ? `\n    "${r.justificativa}"` : '');
+  }).join('\n');
+
+  const escolha = prompt('Revisões aprovadas (digite o Nº para ver detalhes, ou deixe vazio):\n\n' + linhas, '');
+  if (!escolha) return;
+  const num = parseInt(escolha, 10);
+  const rev = data.find(r => r.numero === num);
+  if (!rev) return alert('Número inválido.');
+
+  const detalhes = [
+    `Revisão nº ${rev.numero}`,
+    `Status: ${rev.status}`,
+    `Criada em: ${new Date(rev.created_at).toLocaleString('pt-BR')}`,
+    `Aprovada em: ${rev.approved_at ? new Date(rev.approved_at).toLocaleString('pt-BR') : '—'}`,
+    `Autor: ${rev.created_by || '—'}`,
+    `Justificativa: ${rev.justificativa || '—'}`,
+    `Composições: ${(rev.state_snapshot?.comps || []).length}`,
+    `Atividades: ${(rev.state_snapshot?.comps || []).reduce((a, c) => a + (c.acts?.length || 0), 0)}`,
+    '',
+    'Ações:',
+    '  1 = Ver JSON completo',
+    '  2 = Restaurar como nova edição (revisão permanece imutável)',
+    '  0 = Cancelar'
+  ].join('\n');
+  const acao = prompt(detalhes, '0');
+
+  if (acao === '1') {
+    const { data: full } = await sb.from('project_revisions').select('*').eq('id', rev.id).single();
+    console.log('[Revisão completa]', full);
+    alert('JSON completo enviado ao console (F12).');
+  } else if (acao === '2') {
+    if (!confirm(`Restaurar revisão nº ${rev.numero}?\n\nO estado atual será substituído. A revisão aprovada NÃO é apagada.`)) return;
+    const { data: full } = await sb.from('project_revisions').select('*').eq('id', rev.id).single();
+    if (!full) return;
+    S = full.state_snapshot;
+    migrate(S);
+    await sb.from('schedule_activities').delete().eq('project_id', currentProjectId);
+    if (full.schedule_snapshot && full.schedule_snapshot.length) {
+      const rows = full.schedule_snapshot.map(r => {
+        const { id, created_at, updated_at, ...rest } = r;
+        return rest;
+      });
+      await sb.from('schedule_activities').insert(rows);
+    }
+    await sb.from('projects').update({ approved_revision_id: null }).eq('id', currentProjectId);
+    currentApprovedRevision = null;
+    readOnly = false;
+    atualizarBotoesRevisao();
+    render();
+    alert(`Revisão nº ${rev.numero} restaurada. Edições liberadas.`);
+  }
+}
+
 async function init() {
   // 1. Sempre começa com o estado local (nunca fica em branco)
   try {
@@ -677,6 +857,19 @@ async function init() {
     if (data) {
       currentProjectId = data.id;
       currentProjectName = data.name;
+        if (data.approved_revision_id) {
+    const { data: rev } = await sb.from('project_revisions')
+      .select('id, numero, approved_at, justificativa')
+      .eq('id', data.approved_revision_id)
+      .maybeSingle();
+    if (rev) {
+      currentApprovedRevision = rev;
+      readOnly = true;
+    }
+  } else {
+    currentApprovedRevision = null;
+    readOnly = false;
+  }
 
       // Tenta carregar das tabelas normalizadas
       const { data: schedRows, error: eSch } = await sb
@@ -716,6 +909,8 @@ async function init() {
     } catch (e) {
     console.warn('[Supabase] offline:', e.message);
   }
+
+  atualizarBotoesRevisao();
 
   initDone = true;   // ← libera o save após o init
 }
