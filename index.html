@@ -76,7 +76,7 @@ const SUPABASE_KEY = 'sb_publishable_2Lvithz8wtr6q-fD6n1jTw_QJ0YbRl7';
 let sb = null;                  // ← renomeado
 let currentProjectId = null;
 let currentProjectName = null;
-let initDone = false;
+
 try {
   if (!window.supabase || !window.supabase.createClient) {
     throw new Error('SDK do Supabase não carregou (CDN bloqueado?)');
@@ -168,7 +168,7 @@ let _saveTimer = null;
 function save() {
   // Backup local sempre (não bloqueia)
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
-
+  
   if (!initDone) return;   // ← trava durante o init
   if (!sb) return;
 
@@ -186,6 +186,9 @@ function save() {
         const { error } = await sb
           .from('projects').update(payload).eq('id', currentProjectId);
         if (error) console.error('[Supabase] update:', error);
+        if (!error) {
+          await sincronizarScheduleActivities(currentProjectId, S);
+        }
       } else {
         const { data, error } = await sb
           .from('projects').insert(payload).select().single();
@@ -193,6 +196,7 @@ function save() {
         currentProjectId = data.id;
         atualizarNomeProjeto();
         console.log('[Supabase] projeto criado:', data.id);
+        await sincronizarScheduleActivities(currentProjectId, S);
       }
     } catch (e) {
       console.error('[Supabase] falha:', e);
@@ -589,6 +593,40 @@ async function carregarComposicoesDoBanco() {
   }
 }
 
+async function sincronizarScheduleActivities(projectId, state) {
+  if (!sb || !projectId || !state?.comps) return;
+  try {
+    // Substitui todas as linhas do projeto (simples e seguro)
+    const { error: eDel } = await sb.from('schedule_activities')
+      .delete().eq('project_id', projectId);
+    if (eDel) { console.warn('[Sync] delete:', eDel.message); return; }
+
+    const rows = state.comps.map((c, i) => ({
+      project_id: projectId,
+      composicao_codigo: c.id,
+      ordem: i,
+      nome: c.nome,
+      disciplina: c.disc || null,
+      selected: !!c.usar,
+      fixed_start: c.inicio || null,
+      crew_default: c.crewDef || 1,
+      crew: c.crew || {},
+      inputs_values: c.inputs || [],
+      vars_values: c.vars || [],
+      acts: c.acts || [],
+      notas: c.notas || [],
+      pred_codigo: c.pred || null,
+      lag: c.lag || 0
+    }));
+
+    const { error: eIns } = await sb.from('schedule_activities').insert(rows);
+    if (eIns) console.warn('[Sync] insert:', eIns.message);
+    else console.log(`[Sync] schedule_activities: ${rows.length} linhas`);
+  } catch (e) {
+    console.warn('[Sync] falha:', e.message);
+  }
+}
+let initDone = false;
 async function init() {
   // 1. Sempre começa com o estado local (nunca fica em branco)
   try {
@@ -618,6 +656,7 @@ async function init() {
         return { ...cat, crewDef: 1, crew: {}, usar: false, pred: '', lag: 0, inicio: '' };
       }
       return { ...existente, nome: cat.nome, disc: cat.disc, notas: cat.notas };
+  initDone = true;
     });
   }
   
@@ -638,12 +677,42 @@ async function init() {
     if (data) {
       currentProjectId = data.id;
       currentProjectName = data.name;
-      S = data.state;
-      migrate(S);
-      atualizarNomeProjeto();
-      render();
-      console.log('[Supabase] projeto carregado:', data.name);
-    }
+
+      // Tenta carregar das tabelas normalizadas
+      const { data: schedRows, error: eSch } = await sb
+        .from('schedule_activities')
+        .select('*')
+        .eq('project_id', data.id)
+        .order('ordem');
+
+      if (!eSch && schedRows && schedRows.length > 0) {
+        // Reconstrói S.comps a partir das linhas
+        S = data.state;                         // preserva params/base/vars
+        S.comps = schedRows.map(r => ({
+          id: r.composicao_codigo,
+          nome: r.nome,
+          disc: r.disciplina,
+          crewDef: r.crew_default || 1,
+          crew: r.crew || {},
+          usar: !!r.selected,
+          pred: r.pred_codigo || '',
+          lag: r.lag || 0,
+          inicio: r.fixed_start || '',
+          inputs: r.inputs_values || [],
+          vars: r.vars_values || [],
+          acts: r.acts || [],
+          notas: r.notas || []
+        }));
+        console.log('[Supabase] schedule_activities carregadas do banco:', schedRows.length);
+      } else {
+        console.log('[Supabase] schedule_activities vazio, usando state.comps');
+      }
+
+  migrate(S);
+  atualizarNomeProjeto();
+  render();
+  console.log('[Supabase] projeto carregado:', data.name);
+}
     } catch (e) {
     console.warn('[Supabase] offline:', e.message);
   }
