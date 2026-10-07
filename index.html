@@ -481,6 +481,57 @@ function csvCron(){const sc=schedule();let t='\ufeff#;Composição;Disciplina;Du
 function csvHist(){const{map}=histo();const days=Object.keys(map).sort();const rs=REC.filter(r=>days.some(d=>map[d][r]));let t='\ufeffData;'+rs.join(';')+'\n';days.forEach(d=>{t+=br(d)+';'+rs.map(r=>map[d][r]?String(Math.ceil(map[d][r]-1e-9)):'').join(';')+'\n'});dl('histograma_diario.csv',t,'text/csv')}
 function exportJSON(){dl('projeto_cronograma.json',JSON.stringify(S,null,1),'application/json')}
 function importJSON(i){const f=i.files[0];if(!f)return;f.text().then(t=>{S=migrate(JSON.parse(t));sel=null;render()})}
+
+async function carregarCatalogoDoBanco() {
+  if (!sb) return null;
+  try {
+    const [rRes, rActs, rVer, rCoef] = await Promise.all([
+      sb.from('resources').select('id, nome, tipo_id').eq('active', true),
+      sb.from('unit_activities').select('id, codigo').eq('active', true),
+      sb.from('unit_activity_versions')
+        .select('id, activity_id, disciplina, escopo, servico, unidade, observacao, versao, status')
+        .eq('status', 'publicado').eq('versao', 1),
+      sb.from('unit_activity_resources').select('activity_version_id, resource_id, coeficiente_h_un')
+    ]);
+    if (rRes.error || rActs.error || rVer.error || rCoef.error) {
+      console.warn('[Catálogo] erro no banco, usando fallback local');
+      return null;
+    }
+    const nomePorId = Object.fromEntries(rRes.data.map(r => [r.id, r.nome]));
+    const verPorAct = {};
+    for (const v of rVer.data) verPorAct[v.activity_id] = v;
+    const coefPorVer = {};
+    for (const c of rCoef.data) {
+      coefPorVer[c.activity_version_id] = coefPorVer[c.activity_version_id] || {};
+      coefPorVer[c.activity_version_id][nomePorId[c.resource_id]] = Number(c.coeficiente_h_un);
+    }
+    const base = [];
+    for (const a of rActs.data) {
+      const v = verPorAct[a.id];
+      if (!v) continue;
+      base.push({
+        cod: a.codigo,
+        disc: v.disciplina || '',
+        esc: v.escopo || '',
+        serv: v.servico || '',
+        un: v.unidade || '',
+        fonte: '',
+        obs: v.observacao || '',
+        r: coefPorVer[v.id] || {}
+      });
+    }
+    const recursos = rRes.data.map(r => [
+      r.nome,
+      r.tipo_id === 'mao_obra' ? 'Mão de obra' : 'Equipamento'
+    ]);
+    console.log(`[Catálogo] carregado do banco: ${recursos.length} recursos, ${base.length} atividades`);
+    return { recursos, base };
+  } catch (e) {
+    console.warn('[Catálogo] falha:', e.message);
+    return null;
+  }
+}
+
 async function init() {
   // 1. Sempre começa com o estado local (nunca fica em branco)
   try {
@@ -490,6 +541,16 @@ async function init() {
     S = defaults();
   }
   migrate(S);
+  
+    // Tenta enriquecer o catálogo do banco
+  const cat = await carregarCatalogoDoBanco();
+  if (cat && cat.base.length > 0) {
+    // Substitui as constantes embutidas pelo catálogo do banco
+    S.base = cat.base;
+    // Atualiza REC e TIPO a partir do banco (por consistência)
+    // REC/TIPO são const — não podemos reatribuir, mas o S.base já é suficiente
+  }
+
   sel = null;
   render();
   atualizarNomeProjeto();
